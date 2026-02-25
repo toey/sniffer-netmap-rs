@@ -1,0 +1,13 @@
+[package]
+name = "sniffer"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "sniffer"
+path = "src/main.rs"
+
+[dependencies]
+netmap-sys = { path = "../netmap-sys" }
+libc = "0.2"
+chrono = "0.4"
