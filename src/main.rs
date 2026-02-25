@@ -3,7 +3,6 @@
 mod blacklist;
 mod bypass;
 mod config;
-mod hijack;
 mod logger;
 mod netmap;
 mod packet;
@@ -12,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use blacklist::{Action, Blacklist};
+use blacklist::Blacklist;
 use bypass::BypassList;
 use config::Config;
 use logger::BlockLogger;
@@ -49,17 +48,6 @@ fn main() {
             std::process::exit(1);
         }),
     );
-    let version = Arc::new(cfg.version.clone());
-
-    // Create raw socket for hijacking
-    let raw_sock = match hijack::create_raw_socket() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to create raw socket: {}", e);
-            eprintln!("(Are you running as root?)");
-            std::process::exit(1);
-        }
-    };
 
     println!("Capture:\t\t\t\t\t\t[ {} ]", cfg.interface);
     println!("Logging\t\t\t\t\t\t\t[ block.log ]");
@@ -134,11 +122,10 @@ fn main() {
         let bl = Arc::clone(&blacklist);
         let bp = Arc::clone(&bypass);
         let lg = Arc::clone(&block_logger);
-        let ver = Arc::clone(&version);
         let mpls = cfg.mpls_enabled;
 
         let handle = thread::spawn(move || {
-            netmap_thread(ring_desc, i, bl, bp, lg, raw_sock, ver, mpls);
+            netmap_thread(ring_desc, i, bl, bp, lg, mpls);
         });
         handles.push(handle);
         println!("Start new thread {}", i);
@@ -157,8 +144,6 @@ fn netmap_thread(
     blacklist: Arc<RwLock<Blacklist>>,
     bypass: Arc<BypassList>,
     logger: Arc<BlockLogger>,
-    raw_sock: i32,
-    version: Arc<String>,
     mpls_enabled: bool,
 ) {
     println!(
@@ -191,8 +176,6 @@ fn netmap_thread(
                         &blacklist,
                         &bypass,
                         &logger,
-                        raw_sock,
-                        &version,
                         mpls_enabled,
                     );
                 }
@@ -201,15 +184,12 @@ fn netmap_thread(
     }
 }
 
-/// Process an IP packet: parse HTTP, check blacklist, hijack if needed.
-/// Equivalent to the original `handle_IP()` function.
+/// Process an IP packet: parse HTTP, check blacklist, log if matched.
 fn handle_ip(
     buf: &[u8],
     blacklist: &Arc<RwLock<Blacklist>>,
     bypass: &Arc<BypassList>,
     logger: &Arc<BlockLogger>,
-    raw_sock: i32,
-    version: &str,
     mpls_enabled: bool,
 ) {
     let pkt = match packet::parse_packet(buf, mpls_enabled) {
@@ -246,36 +226,8 @@ fn handle_ip(
     let src_ip = pkt.ip.src;
     let dst_ip = pkt.ip.dst;
     let src_port = pkt.tcp.src_port;
-    let seq = pkt.tcp.seq;
-    let ack = pkt.tcp.ack;
-    let payload_len = pkt.payload.len() as u32;
 
-    let mut is_domain = false;
-    let mut monitor_only = false;
-
-    let redirect_url = bl
-        .get_redirect(&hostname)
-        .cloned()
-        .unwrap_or_default();
-
-    match entry.action {
-        Action::Block => {
-            // index "0:0" → domain block
-            is_domain = true;
-            hijack::hijack_session(
-                raw_sock, src_ip, dst_ip, src_port, 80, seq, ack, payload_len,
-                &redirect_url, version,
-            );
-        }
-        Action::MonitorDomain => {
-            // index "2:2" → monitor only
-            is_domain = true;
-        }
-        Action::MonitorUrl => {
-            // index "3:3" → URL-level monitor
-            monitor_only = true;
-        }
-    }
+    let is_domain = matches!(entry.action, blacklist::Action::MonitorDomain);
 
     // Extract request URI and build full URI
     let req_uri = packet::get_request_uri(pkt.payload).unwrap_or_default();
@@ -283,16 +235,8 @@ fn handle_ip(
     full_uri = full_uri.replace('\n', "").replace('\r', "");
     let full_uri = full_uri.trim().to_lowercase();
 
-    // Check URL-level match
+    // Log if domain-level match or URL-level match
     if is_domain || bl.find_url(&full_uri) {
-        if !is_domain && !monitor_only {
-            hijack::hijack_session(
-                raw_sock, src_ip, dst_ip, src_port, 80, seq, ack, payload_len,
-                &redirect_url, version,
-            );
-        }
-
-        // Log the blocked/monitored request
         let datetime = chrono::Local::now()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
